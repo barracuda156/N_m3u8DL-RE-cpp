@@ -2,6 +2,7 @@
 #include "parser/hls_extractor.hpp"
 #include "parser/dash_extractor.hpp"
 #include "common/logger.hpp"
+#include <cstdint>
 
 namespace n_m3u8dl {
 
@@ -28,6 +29,15 @@ std::vector<StreamSpec> StreamExtractor::extract() {
     }
 
     base_url_ = response.final_url;
+
+    // Strip a leading UTF-8 BOM (EF BB BF), which some origins/CDNs prepend
+    // and which would otherwise break the "#EXTM3U"/"<MPD" prefix checks.
+    if (response.body.size() >= 3 &&
+        static_cast<uint8_t>(response.body[0]) == 0xEF &&
+        static_cast<uint8_t>(response.body[1]) == 0xBB &&
+        static_cast<uint8_t>(response.body[2]) == 0xBF) {
+        response.body.erase(0, 3);
+    }
 
     auto type = detect_type(response.body);
 

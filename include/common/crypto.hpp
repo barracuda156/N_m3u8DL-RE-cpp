@@ -30,6 +30,7 @@ public:
 
 class ChaCha20Util {
 public:
+    // nonce must be 12 or 8 bytes; an 8-byte nonce is zero-padded to 12.
     static std::vector<uint8_t> decrypt_per_1024_bytes(
         std::span<const uint8_t> data,
         std::span<const uint8_t> key,

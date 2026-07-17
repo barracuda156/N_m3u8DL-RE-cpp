@@ -8,8 +8,56 @@
 #include <thread>
 #include <filesystem>
 #include <cstdlib>
+#include <vector>
+#include <optional>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#ifdef __APPLE__
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char** environ;
+#endif
 
 using namespace n_m3u8dl;
+
+// Runs an external program with argv passed directly (no shell involved),
+// so arguments containing quotes or other shell metacharacters are safe.
+// Returns the process exit code, or -1 if the process could not be started.
+static int run_process(const std::vector<std::string>& args, bool silent = false) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& arg : args) {
+        argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
+    if (silent) {
+        posix_spawn_file_actions_addopen(&file_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_addopen(&file_actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    }
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, argv[0], &file_actions, nullptr, argv.data(), environ);
+    posix_spawn_file_actions_destroy(&file_actions);
+    if (rc != 0) {
+        return -1;
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        return -1;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    return -1;
+}
 
 LogLevel parse_log_level(const std::string& level) {
     if (level == "DEBUG") return LogLevel::DEBUG;
@@ -60,16 +108,21 @@ int select_stream_interactive(const std::vector<StreamSpec>& streams) {
     }
 }
 
-bool mux_with_ffmpeg(const std::string& input_file, const std::string& output_file,
+bool mux_with_ffmpeg(const std::vector<std::string>& input_files, const std::string& output_file,
                      const std::string& ffmpeg_path) {
-    Logger::info("Muxing with FFmpeg: " + input_file + " -> " + output_file);
+    Logger::info("Muxing with FFmpeg: " + std::to_string(input_files.size()) + " input(s) -> " + output_file);
 
-    // Build FFmpeg command
-    std::string command = ffmpeg_path + " -i \"" + input_file + "\" -c copy \"" + output_file + "\" -y";
+    std::vector<std::string> args = {ffmpeg_path};
+    for (const auto& input_file : input_files) {
+        args.push_back("-i");
+        args.push_back(input_file);
+    }
+    args.push_back("-c");
+    args.push_back("copy");
+    args.push_back(output_file);
+    args.push_back("-y");
 
-    Logger::debug("Executing: " + command);
-
-    int result = std::system(command.c_str());
+    int result = run_process(args);
 
     if (result == 0) {
         Logger::info("FFmpeg muxing completed successfully");
@@ -78,6 +131,21 @@ bool mux_with_ffmpeg(const std::string& input_file, const std::string& output_fi
         Logger::error("FFmpeg muxing failed with exit code: " + std::to_string(result));
         return false;
     }
+}
+
+// Finds the audio rendition matching a video variant's AUDIO group, if any.
+// Prefers the first match, matching the order renditions appear in the
+// master playlist (typically the default/highest-quality rendition).
+const StreamSpec* find_matching_audio(const std::vector<StreamSpec>& streams, const StreamSpec& video) {
+    if (!video.audio_group_id) {
+        return nullptr;
+    }
+    for (const auto& s : streams) {
+        if (s.media_type == MediaType::AUDIO && s.group_id == video.audio_group_id) {
+            return &s;
+        }
+    }
+    return nullptr;
 }
 
 std::string find_ffmpeg_binary() {
@@ -91,8 +159,7 @@ std::string find_ffmpeg_binary() {
     };
 
     for (const char* path : paths) {
-        std::string test_cmd = std::string(path) + " -version > /dev/null 2>&1";
-        if (std::system(test_cmd.c_str()) == 0) {
+        if (run_process({path, "-version"}, /*silent=*/true) == 0) {
             Logger::debug("Found FFmpeg at: " + std::string(path));
             return std::string(path);
         }
@@ -173,14 +240,35 @@ int main(int argc, char** argv) {
         Logger::info("Downloading: " + selected_stream.to_short_string());
 
         // If stream doesn't have playlist, fetch it (for HLS master playlists)
-        if (!selected_stream.playlist && !selected_stream.url.empty()) {
-            Logger::info("Fetching media playlist: " + selected_stream.url);
-            StreamExtractor media_extractor(selected_stream.url);
+        auto fetch_playlist_if_needed = [](StreamSpec& spec) -> bool {
+            if (spec.playlist || spec.url.empty()) {
+                return true;
+            }
+            Logger::info("Fetching media playlist: " + spec.url);
+            StreamExtractor media_extractor(spec.url);
             auto media_streams = media_extractor.extract();
             if (!media_streams.empty() && media_streams[0].playlist) {
-                selected_stream.playlist = media_streams[0].playlist;
-            } else {
-                Logger::error("Failed to fetch media playlist");
+                spec.playlist = media_streams[0].playlist;
+                return true;
+            }
+            Logger::error("Failed to fetch media playlist");
+            return false;
+        };
+
+        if (!fetch_playlist_if_needed(selected_stream)) {
+            HttpClient::global_cleanup();
+            return 1;
+        }
+
+        // For HLS, a video variant with an AUDIO group references a
+        // separate audio rendition that must be downloaded (and muxed)
+        // alongside it, or the output would silently have no sound.
+        const StreamSpec* matched_audio_const = find_matching_audio(streams, selected_stream);
+        std::optional<StreamSpec> audio_stream;
+        if (matched_audio_const) {
+            audio_stream = *matched_audio_const;
+            Logger::info("Paired audio track: " + audio_stream->to_short_string());
+            if (!fetch_playlist_if_needed(*audio_stream)) {
                 HttpClient::global_cleanup();
                 return 1;
             }
@@ -191,66 +279,87 @@ int main(int argc, char** argv) {
         download_config.tmp_dir = options.tmp_dir.value_or("./temp");
         download_config.save_dir = options.save_dir.value_or(".");
         download_config.save_name = options.save_name.value_or("output");
+        download_config.save_pattern = options.save_pattern.value_or("");
         download_config.headers = options.headers;
         download_config.download_retry_count = options.download_retry_count;
         download_config.timeout = options.http_request_timeout;
+        download_config.thread_count = options.thread_count;
         download_config.binary_merge = options.binary_merge;
         download_config.delete_after_done = options.del_after_done;
+        download_config.skip_merge = options.skip_merge;
 
         // Create download manager and start download
         DownloadManager manager(download_config);
 
-        if (!options.skip_merge) {
-            bool success = manager.download_stream(selected_stream);
+        bool success = manager.download_stream(selected_stream, audio_stream ? "video" : "");
+        std::string video_output = manager.get_last_output_file();
 
-            if (!success) {
-                Logger::error("Download failed");
-                HttpClient::global_cleanup();
-                return 1;
-            }
+        std::string audio_output;
+        if (success && audio_stream) {
+            DownloadManager audio_manager(download_config);
+            success = audio_manager.download_stream(*audio_stream, "audio");
+            audio_output = audio_manager.get_last_output_file();
+        }
 
-            // FFmpeg muxing if requested
-            if (options.mux_to_mp4) {
-                std::string input_file = manager.get_last_output_file();
-                std::string output_file = input_file;
-
-                // Replace extension with .mp4
-                size_t dot_pos = output_file.find_last_of('.');
-                if (dot_pos != std::string::npos) {
-                    output_file = output_file.substr(0, dot_pos) + ".mp4";
-                } else {
-                    output_file += ".mp4";
-                }
-
-                // Find FFmpeg binary
-                std::string ffmpeg_path = options.ffmpeg_path.value_or(find_ffmpeg_binary());
-
-                // Mux with FFmpeg
-                bool mux_success = mux_with_ffmpeg(input_file, output_file, ffmpeg_path);
-
-                if (mux_success) {
-                    Logger::info("All done! Output: " + output_file);
-
-                    // Optionally delete intermediate file
-                    if (options.del_after_done) {
-                        Logger::info("Removing intermediate file: " + input_file);
-                        std::filesystem::remove(input_file);
-                    }
-                } else {
-                    Logger::warn("FFmpeg muxing failed, but download succeeded");
-                    Logger::info("Output: " + input_file);
-                }
-            } else {
-                Logger::info("All done!");
-            }
-
+        if (!success) {
+            Logger::error("Download failed");
             HttpClient::global_cleanup();
-            return 0;
-        } else {
-            Logger::info("Skipping merge as requested");
+            return 1;
+        }
+
+        if (options.skip_merge) {
             HttpClient::global_cleanup();
             return 0;
         }
+
+        std::vector<std::string> track_outputs = {video_output};
+        if (!audio_output.empty()) {
+            track_outputs.push_back(audio_output);
+        }
+
+        // FFmpeg muxing if requested
+        if (options.mux_to_mp4) {
+            std::string output_file = video_output;
+
+            // Replace extension with .mp4
+            size_t dot_pos = output_file.find_last_of('.');
+            if (dot_pos != std::string::npos) {
+                output_file = output_file.substr(0, dot_pos) + ".mp4";
+            } else {
+                output_file += ".mp4";
+            }
+
+            // Find FFmpeg binary
+            std::string ffmpeg_path = options.ffmpeg_path.value_or(find_ffmpeg_binary());
+
+            // Mux with FFmpeg
+            bool mux_success = mux_with_ffmpeg(track_outputs, output_file, ffmpeg_path);
+
+            if (mux_success) {
+                Logger::info("All done! Output: " + output_file);
+
+                // Optionally delete intermediate files
+                if (options.del_after_done) {
+                    for (const auto& f : track_outputs) {
+                        Logger::info("Removing intermediate file: " + f);
+                        std::filesystem::remove(f);
+                    }
+                }
+            } else {
+                Logger::warn("FFmpeg muxing failed, but download succeeded");
+                for (const auto& f : track_outputs) {
+                    Logger::info("Output: " + f);
+                }
+            }
+        } else {
+            Logger::info("All done!");
+            for (const auto& f : track_outputs) {
+                Logger::info("Output: " + f);
+            }
+        }
+
+        HttpClient::global_cleanup();
+        return 0;
 
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

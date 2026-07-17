@@ -12,6 +12,7 @@ struct CommandLineOptions {
     std::optional<std::string> tmp_dir;
     std::optional<std::string> save_dir;
     std::optional<std::string> save_name;
+    std::optional<std::string> save_pattern; // Filename template, e.g. "<SaveName>_<Resolution>_<Language>"
     std::optional<std::string> log_file;
     std::optional<std::string> base_url;
     int thread_count = 0;  // 0 = auto

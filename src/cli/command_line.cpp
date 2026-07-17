@@ -16,6 +16,10 @@ CommandLineOptions parse_arguments(int argc, char** argv) {
     app.add_option("--tmp-dir", options.tmp_dir, "Temporary file directory");
     app.add_option("--save-dir", options.save_dir, "Output directory");
     app.add_option("--save-name", options.save_name, "Output filename");
+    app.add_option("--save-pattern", options.save_pattern,
+                   "Output filename template, e.g. \"<SaveName>_<Resolution>_<Language>\". "
+                   "Vars: <SaveName> <Id> <Codecs> <Language> <Bandwidth> <Resolution> "
+                   "<FrameRate> <Channels> <VideoRange> <MediaType> <GroupId>");
     app.add_option("--log-file-path", options.log_file, "Log file path");
     app.add_option("--base-url", options.base_url, "Base URL");
 
@@ -59,13 +63,11 @@ CommandLineOptions parse_arguments(int argc, char** argv) {
 
     try {
         app.parse(argc, argv);
-
     } catch (const CLI::ParseError& e) {
-        // Handle special exit codes (help, version, etc.)
-        int exit_code = app.exit(e);
-        if (exit_code != 0) {
-            std::exit(exit_code);
-        }
+        // Covers --help/--version as well as actual parse errors; in every
+        // case CLI11 has already printed its message and there is nothing
+        // left to run.
+        std::exit(app.exit(e));
     }
 
     // Parse headers

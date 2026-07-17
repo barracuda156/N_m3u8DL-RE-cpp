@@ -54,7 +54,7 @@ void DownloadManager::cleanup_temp_files(const std::vector<std::string>& files) 
     }
 }
 
-bool DownloadManager::download_stream(const StreamSpec& stream) {
+bool DownloadManager::download_stream(const StreamSpec& stream, const std::string& track_suffix) {
     if (!stream.playlist) {
         Logger::error("Stream has no playlist information");
         return false;
@@ -62,11 +62,13 @@ bool DownloadManager::download_stream(const StreamSpec& stream) {
 
     const auto& playlist = *stream.playlist;
     std::vector<std::string> segment_files;
+    std::string tmp_prefix = config_.tmp_dir + (track_suffix.empty() ? "" : "/" + track_suffix);
+    Util::create_directories(tmp_prefix);
 
     // Download initialization segment first if it exists (for fMP4 streams)
     if (playlist.media_init) {
         Logger::info("Downloading initialization segment...");
-        std::string init_file = config_.tmp_dir + "/seg_init.tmp";
+        std::string init_file = tmp_prefix + "/seg_init.tmp";
         auto init_result = downloader_->download_segment(*playlist.media_init, init_file);
 
         if (init_result.success) {
@@ -93,16 +95,19 @@ bool DownloadManager::download_stream(const StreamSpec& stream) {
 
     Logger::info("Downloading " + std::to_string(all_segments.size()) + " segments...");
 
-    // Create thread pool with reasonable limit to avoid overwhelming servers
-    // Especially important for byte-range downloads from the same URL
-    uint32_t max_threads = std::min(std::thread::hardware_concurrency(), 4u);
+    // Use the configured thread count, or a reasonable default limit to
+    // avoid overwhelming servers (especially for byte-range downloads from
+    // the same URL) when left on auto.
+    uint32_t max_threads = config_.thread_count > 0
+        ? static_cast<uint32_t>(config_.thread_count)
+        : std::min(std::thread::hardware_concurrency(), 4u);
     BS::thread_pool pool(max_threads);
     std::vector<std::future<DownloadResult>> futures;
 
     // Download segments in parallel
     for (size_t i = 0; i < all_segments.size(); ++i) {
         const auto& segment = all_segments[i];
-        std::string segment_file = config_.tmp_dir + "/seg_" + std::to_string(i) + ".tmp";
+        std::string segment_file = tmp_prefix + "/seg_" + std::to_string(i) + ".tmp";
         segment_files.push_back(segment_file);
 
         futures.push_back(pool.submit_task([this, segment, segment_file]() {
@@ -133,8 +138,23 @@ bool DownloadManager::download_stream(const StreamSpec& stream) {
         return false;
     }
 
+    if (config_.skip_merge) {
+        Logger::info("Skipping merge as requested; segments kept in " + tmp_prefix);
+        return true;
+    }
+
     // Generate output filename
-    std::string output_file = config_.save_dir + "/" + config_.save_name;
+    std::string base_name;
+    if (!config_.save_pattern.empty()) {
+        base_name = Util::format_save_pattern(config_.save_pattern, stream, config_.save_name, 0);
+    } else {
+        base_name = config_.save_name;
+        if (!track_suffix.empty()) {
+            base_name += "." + track_suffix;
+        }
+    }
+
+    std::string output_file = config_.save_dir + "/" + base_name;
     if (stream.extension) {
         output_file += "." + *stream.extension;
     } else {

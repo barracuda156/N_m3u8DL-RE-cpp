@@ -116,12 +116,18 @@ std::vector<uint8_t> ChaCha20Util::decrypt_per_1024_bytes(
     std::span<const uint8_t> key,
     std::span<const uint8_t> nonce) {
 
-    // ChaCha20 decryption per 1024-byte blocks
-    // This is a simplified implementation - full implementation would use OpenSSL's ChaCha20
-
-    if (key.size() != 32 || nonce.size() != 12) {
-        throw std::invalid_argument("ChaCha20 requires 32-byte key and 12-byte nonce");
+    if (key.size() != 32 || (nonce.size() != 12 && nonce.size() != 8)) {
+        throw std::invalid_argument("ChaCha20 requires 32-byte key and 12- or 8-byte nonce");
     }
+
+    // OpenSSL's raw ChaCha20 cipher takes a 16-byte IV: a 4-byte little-endian
+    // block counter followed by the 12-byte nonce (RFC 7539 state words 12-15).
+    // An 8-byte nonce is left-padded with zeros to 12 bytes, per the reference
+    // tool. Each 1024-byte chunk is independently encrypted with the counter
+    // reset to 0, matching the reference tool's per-chunk keystream restart.
+    uint8_t iv16[16] = {0};
+    size_t nonce_offset = 4 + (12 - nonce.size());
+    std::copy(nonce.begin(), nonce.end(), iv16 + nonce_offset);
 
     std::vector<uint8_t> output(data.size());
 
@@ -130,21 +136,20 @@ std::vector<uint8_t> ChaCha20Util::decrypt_per_1024_bytes(
         throw std::runtime_error("Failed to create cipher context");
     }
 
-    // Process in 1024-byte chunks
     const size_t chunk_size = 1024;
     size_t offset = 0;
 
     while (offset < data.size()) {
         size_t process_size = std::min(chunk_size, data.size() - offset);
 
-        if (EVP_DecryptInit_ex(ctx, EVP_chacha20(), nullptr, key.data(), nonce.data()) != 1) {
+        if (EVP_DecryptInit_ex(ctx, EVP_chacha20(), nullptr, key.data(), iv16) != 1) {
             EVP_CIPHER_CTX_free(ctx);
             throw std::runtime_error("Failed to initialize ChaCha20 decryption");
         }
 
         int len = 0;
         if (EVP_DecryptUpdate(ctx, output.data() + offset, &len,
-                            data.data() + offset, process_size) != 1) {
+                            data.data() + offset, static_cast<int>(process_size)) != 1) {
             EVP_CIPHER_CTX_free(ctx);
             throw std::runtime_error("ChaCha20 decryption failed");
         }

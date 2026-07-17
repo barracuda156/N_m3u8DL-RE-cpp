@@ -19,7 +19,8 @@ enum class EncryptMethod {
     AES_128,
     AES_128_ECB,
     CHACHA20,
-    SAMPLE_AES  // Parsed but not yet implemented
+    SAMPLE_AES,     // Parsed but not yet implemented
+    UNSUPPORTED_DRM // KEYFORMAT indicates a DRM system (Widevine/PlayReady/FairPlay); not decryptable here
 };
 
 enum class ExtractorType {
@@ -70,6 +71,12 @@ struct StreamSpec {
     std::optional<Playlist> playlist;
     std::optional<std::string> extension;
     int segments_count = 0;
+
+    // On a video variant (#EXT-X-STREAM-INF), the GROUP-ID of the audio/
+    // subtitle renditions it should be paired with; unset on the
+    // renditions themselves (which use group_id for their own GROUP-ID).
+    std::optional<std::string> audio_group_id;
+    std::optional<std::string> subtitle_group_id;
 
     std::string to_short_string() const;
     std::string to_string() const;

@@ -4,6 +4,7 @@
 #include <sstream>
 #include <algorithm>
 #include <regex>
+#include <cstdint>
 
 namespace n_m3u8dl {
 
@@ -18,6 +19,17 @@ namespace {
     constexpr const char* TAG_MAP = "#EXT-X-MAP:";
     constexpr const char* TAG_BYTERANGE = "#EXT-X-BYTERANGE:";
     constexpr const char* TAG_ENDLIST = "#EXT-X-ENDLIST";
+    constexpr const char* TAG_DISCONTINUITY = "#EXT-X-DISCONTINUITY";
+
+    // Per HLS spec, when EXT-X-KEY has no explicit IV the IV defaults to the
+    // segment's media sequence number, as a big-endian 128-bit value.
+    std::vector<uint8_t> default_iv_from_index(int index) {
+        std::vector<uint8_t> iv(16, 0);
+        for (int i = 0; i < 4; ++i) {
+            iv[15 - i] = static_cast<uint8_t>(index >> (8 * i));
+        }
+        return iv;
+    }
 }
 
 HLSExtractor::HLSExtractor(const std::string& url, const std::string& base_url)
@@ -114,7 +126,15 @@ std::vector<StreamSpec> HLSExtractor::parse_master_playlist() {
             }
 
             current_spec.video_range = get_attribute(line, "VIDEO-RANGE");
-            current_spec.group_id = get_attribute(line, "AUDIO");
+
+            auto audio_group = get_attribute(line, "AUDIO");
+            if (!audio_group.empty()) {
+                current_spec.audio_group_id = audio_group;
+            }
+            auto subtitle_group = get_attribute(line, "SUBTITLES");
+            if (!subtitle_group.empty()) {
+                current_spec.subtitle_group_id = subtitle_group;
+            }
 
             expect_playlist = true;
         } else if (line.find(TAG_MEDIA) == 0) {
@@ -155,6 +175,7 @@ std::vector<StreamSpec> HLSExtractor::parse_master_playlist() {
 
 Playlist HLSExtractor::parse_media_playlist() {
     Playlist playlist;
+    playlist.is_live = true;  // Cleared if #EXT-X-ENDLIST is present.
     MediaPart current_part;
     MediaSegment current_segment;
     EncryptInfo current_encrypt_info;
@@ -184,6 +205,8 @@ Playlist HLSExtractor::parse_media_playlist() {
                 segment_duration = std::stod(duration_str);
             }
         } else if (line.find(TAG_KEY) == 0) {
+            current_encrypt_info = EncryptInfo();
+
             auto method_str = get_attribute(line, "METHOD");
             if (method_str == "AES-128") {
                 current_encrypt_info.method = EncryptMethod::AES_128;
@@ -193,13 +216,23 @@ Playlist HLSExtractor::parse_media_playlist() {
                 current_encrypt_info.method = EncryptMethod::NONE;
             }
 
+            // KEYFORMAT defaults to "identity" (a plain AES key fetched from
+            // URI) when absent. Any other value names a DRM system
+            // (com.apple.streamingkeydelivery, com.widevine.alpha, etc)
+            // whose key can't be fetched as if it were a raw AES-128 key.
+            auto key_format = get_attribute(line, "KEYFORMAT");
+            if (!key_format.empty() && key_format != "identity" &&
+                current_encrypt_info.method != EncryptMethod::NONE) {
+                current_encrypt_info.method = EncryptMethod::UNSUPPORTED_DRM;
+            }
+
             auto key_uri = get_attribute(line, "URI");
-            if (!key_uri.empty()) {
+            if (!key_uri.empty() && current_encrypt_info.method != EncryptMethod::UNSUPPORTED_DRM) {
                 current_encrypt_info.key_url = Util::combine_url(base_url_, key_uri);
             }
 
             auto iv_str = get_attribute(line, "IV");
-            if (!iv_str.empty() && iv_str.find("0x") == 0) {
+            if (!iv_str.empty()) {
                 current_encrypt_info.iv = Util::hex_to_bytes(iv_str);
             }
         } else if (line.find(TAG_MAP) == 0) {
@@ -219,6 +252,13 @@ Playlist HLSExtractor::parse_media_playlist() {
                     }
                 }
 
+                if (current_encrypt_info.method != EncryptMethod::NONE) {
+                    init_seg.encrypt_info = current_encrypt_info;
+                    if (!init_seg.encrypt_info.iv) {
+                        init_seg.encrypt_info.iv = default_iv_from_index(segment_index);
+                    }
+                }
+
                 playlist.media_init = init_seg;
             }
         } else if (line.find(TAG_BYTERANGE) == 0) {
@@ -230,16 +270,35 @@ Playlist HLSExtractor::parse_media_playlist() {
                     int64_t length = std::stoll(range_str.substr(0, at_pos));
                     int64_t offset = std::stoll(range_str.substr(at_pos + 1));
                     next_range = {offset, offset + length - 1};
+                } else {
+                    // No explicit offset: range continues immediately after
+                    // the previous segment's byte range.
+                    int64_t length = std::stoll(range_str);
+                    int64_t offset = current_segment.stop_range.value_or(-1) + 1;
+                    next_range = {offset, offset + length - 1};
                 }
             }
         } else if (line.find(TAG_ENDLIST) == 0) {
             playlist.is_live = false;
+        } else if (line == TAG_DISCONTINUITY) {
+            // Timestamps reset across a discontinuity (ad break, stream
+            // splice); keep pre/post segments in separate parts so the
+            // merge doesn't produce broken timestamps.
+            if (!current_part.segments.empty()) {
+                playlist.media_parts.push_back(current_part);
+                current_part = MediaPart();
+            }
         } else if (line[0] != '#') {
             current_segment = MediaSegment();
             current_segment.url = Util::combine_url(base_url_, line);
             current_segment.duration = segment_duration;
             current_segment.encrypt_info = current_encrypt_info;
             current_segment.index = segment_index++;
+
+            if (current_segment.encrypt_info.method != EncryptMethod::NONE &&
+                !current_segment.encrypt_info.iv) {
+                current_segment.encrypt_info.iv = default_iv_from_index(current_segment.index);
+            }
 
             if (next_range) {
                 current_segment.start_range = next_range->first;

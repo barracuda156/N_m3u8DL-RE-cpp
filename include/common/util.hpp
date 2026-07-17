@@ -1,5 +1,6 @@
 #pragma once
 
+#include "common/types.hpp"
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -13,6 +14,13 @@ public:
     static std::string combine_url(const std::string& base, const std::string& relative);
     static std::string get_valid_filename(const std::string& name, const std::string& replacement = "_");
     static bool is_absolute_url(const std::string& url);
+
+    // Expands <SaveName>/<Id>/<Codecs>/<Language>/<Bandwidth>/<Resolution>/
+    // <FrameRate>/<Channels>/<VideoRange>/<MediaType>/<GroupId> in a
+    // filename pattern from the given stream's metadata, then sanitizes
+    // the result into a valid filename (no extension).
+    static std::string format_save_pattern(const std::string& pattern, const StreamSpec& stream,
+                                            const std::string& save_name, int task_id);
 
     static std::vector<uint8_t> hex_to_bytes(const std::string& hex);
     static std::string bytes_to_hex(std::span<const uint8_t> bytes);

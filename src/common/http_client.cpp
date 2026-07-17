@@ -1,9 +1,31 @@
 #include "common/http_client.hpp"
 #include "common/logger.hpp"
+#include "common/util.hpp"
 #include <sstream>
 #include <cstring>
+#include <cctype>
+#include <algorithm>
 
 namespace n_m3u8dl {
+
+namespace {
+constexpr const char* kDefaultUserAgent =
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/78.0.3904.108 Safari/537.36";
+
+bool has_header_case_insensitive(const std::map<std::string, std::string>& headers, const std::string& name) {
+    for (const auto& [key, value] : headers) {
+        (void)value;
+        if (key.size() == name.size() &&
+            std::equal(key.begin(), key.end(), name.begin(), [](unsigned char a, unsigned char b) {
+                return std::tolower(a) == std::tolower(b);
+            })) {
+            return true;
+        }
+    }
+    return false;
+}
+} // namespace
 
 void HttpClient::global_init() {
     curl_global_init(CURL_GLOBAL_ALL);
@@ -149,8 +171,12 @@ HttpResponse HttpClient::get(const std::string& url) {
     curl_easy_setopt(handle_, CURLOPT_HEADERFUNCTION, header_callback);
     curl_easy_setopt(handle_, CURLOPT_HEADERDATA, &response.headers);
 
-    // Set custom headers
+    // Set custom headers; fall back to a browser User-Agent since many CDNs
+    // reject requests with no/curl UA and the user can still override it.
     struct curl_slist* header_list = nullptr;
+    if (!has_header_case_insensitive(headers_, "User-Agent")) {
+        header_list = curl_slist_append(header_list, (std::string("User-Agent: ") + kDefaultUserAgent).c_str());
+    }
     for (const auto& [key, value] : headers_) {
         std::string header = key + ": " + value;
         header_list = curl_slist_append(header_list, header.c_str());
@@ -200,7 +226,7 @@ HttpResponse HttpClient::get_with_redirect_tracking(const std::string& url) {
         if (response.status_code >= 300 && response.status_code < 400) {
             auto it = response.headers.find("Location");
             if (it != response.headers.end()) {
-                current_url = it->second;
+                current_url = Util::combine_url(current_url, it->second);
                 Logger::debug("Redirected => " + current_url);
                 redirect_count++;
                 continue;
@@ -208,6 +234,10 @@ HttpResponse HttpClient::get_with_redirect_tracking(const std::string& url) {
         }
 
         response.final_url = current_url;
+        if (response.status_code >= 400) {
+            Logger::warn("HTTP " + std::to_string(response.status_code) + " for: " + current_url);
+            response.success = false;
+        }
         set_follow_redirects(original_follow);
         return response;
     }
